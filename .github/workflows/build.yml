@@ -11,15 +11,15 @@ jobs:
       matrix:
         include:
           - os: windows-latest
-            icon: icons/icon.ico
+            icon: icons/1.ico
             name: QB_Cleaner_Windows
             ext: .exe
           - os: ubuntu-latest
-            icon: icons/icon.png
+            icon: icons/1.png
             name: QB_Cleaner_Linux
             ext: ""
           - os: macos-latest
-            icon: icons/icon.icns
+            icon: icons/1.icns
             name: QB_Cleaner_macOS
             ext: ""
 
