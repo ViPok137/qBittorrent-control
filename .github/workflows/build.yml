@@ -2,7 +2,7 @@ name: Build QB Cleaner
 
 on:
   push:
-    branches: [ "main" ] # Сборка запускается при пуше в ветку main
+    branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
 
@@ -13,15 +13,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Указываем ОС, на которых GitHub будет собирать файл
         os: [ubuntu-latest, windows-latest, macos-latest]
 
     steps:
     - name: Checkout code
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4 # Обновлено до v4
 
     - name: Set up Python
-      uses: actions/setup-python@v4
+      uses: actions/setup-python@v5 # Обновлено до v5
       with:
         python-version: '3.10'
 
@@ -39,7 +38,7 @@ jobs:
       run: pyinstaller --onefile --name "qb_cleaner" qb_cleaner.py
 
     - name: Upload Artifact
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4 # ИСПРАВЛЕНО: v3 заменена на v4
       with:
         name: qb-cleaner-${{ matrix.os }}
-        path: dist/*
+        path: dist/
