@@ -11,17 +11,26 @@ jobs:
       matrix:
         include:
           - os: windows-latest
-            icon: icons/1.ico
-            name: QB_Cleaner_Windows
+            icon_cleaner: icons/icon.ico
+            icon_server: icons/icon.ico
+            name_cleaner: QB_Cleaner_Windows
+            name_server: QB_Cleaner_Server_Windows
             ext: .exe
+            build_server: true
+
           - os: ubuntu-latest
-            icon: icons/1.png
-            name: QB_Cleaner_Linux
+            icon_cleaner: icons/icon.png
+            icon_server: icons/icon.png
+            name_cleaner: QB_Cleaner_Linux
+            name_server: QB_Cleaner_Server_Linux
             ext: ""
+            build_server: true
+
           - os: macos-latest
-            icon: icons/1.icns
-            name: QB_Cleaner_macOS
+            icon_cleaner: icons/icon.icns
+            name_cleaner: QB_Cleaner_macOS
             ext: ""
+            build_server: false
 
     steps:
       - uses: actions/checkout@v4
@@ -34,15 +43,52 @@ jobs:
       - name: Установка зависимостей
         run: pip install pyinstaller requests
 
-      - name: Сборка
+      - name: Сборка QB_Cleaner
         run: >
           pyinstaller --onefile
-          --icon="${{ matrix.icon }}"
-          --name "${{ matrix.name }}"
+          --icon="${{ matrix.icon_cleaner }}"
+          --name "${{ matrix.name_cleaner }}"
           qb_cleaner.py
 
-      - name: Загрузка артефакта
+      - name: Сборка QB_Cleaner_Server
+        if: matrix.build_server == true
+        run: >
+          pyinstaller --onefile
+          --icon="${{ matrix.icon_server }}"
+          --name "${{ matrix.name_server }}"
+          qb_cleaner_server.py
+
+      - name: Загрузка QB_Cleaner
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.name }}
-          path: dist/${{ matrix.name }}${{ matrix.ext }}
+          name: ${{ matrix.name_cleaner }}
+          path: dist/${{ matrix.name_cleaner }}${{ matrix.ext }}
+
+      - name: Загрузка QB_Cleaner_Server
+        if: matrix.build_server == true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name_server }}
+          path: dist/${{ matrix.name_server }}${{ matrix.ext }}
+
+  merge:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Скачать все артефакты
+        uses: actions/download-artifact@v4
+        with:
+          path: all_files
+
+      - name: Упаковать в один архив
+        run: |
+          mkdir release
+          find all_files -type f -exec cp {} release/ \;
+          cd release
+          zip -r ../QB_Cleaner_All.zip .
+
+      - name: Загрузить общий архив
+        uses: actions/upload-artifact@v4
+        with:
+          name: QB_Cleaner_All
+          path: QB_Cleaner_All.zip
