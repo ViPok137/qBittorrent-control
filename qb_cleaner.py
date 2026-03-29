@@ -4,6 +4,7 @@ import sys
 import time
 import logging
 import configparser
+import shutil
 from datetime import datetime, timedelta
 import requests
 from requests.exceptions import RequestException
@@ -28,12 +29,39 @@ def load_config():
             'DAYS_LIMIT': '14',
             'RATIO_THRESHOLD': '1.0',
             'LEECH_SUM_THRESHOLD': '14',
-            'STARTUP_WAIT_SEC': '10'
+            'STARTUP_WAIT_SEC': '10',
+            'DISK_THRESHOLD_PERCENT': '90',
+            'RSS_RULE_NAME': '',
+            'DOWNLOAD_PROGRESS_THRESHOLD': '25'
         }
         with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
             config.write(f)
+        print("⚙️ Создан config.ini — заполни RSS_RULE_NAME названием правила RSS")
     else:
         config.read(CONFIG_FILE, encoding='utf-8')
+
+    settings = config['SETTINGS']
+
+    try:
+        threshold = int(settings.get('DISK_THRESHOLD_PERCENT', '90'))
+        if not 1 <= threshold <= 100:
+            raise ValueError
+    except ValueError:
+        print("❌ DISK_THRESHOLD_PERCENT должен быть от 1 до 100. Установлено 90")
+        config['SETTINGS']['DISK_THRESHOLD_PERCENT'] = '90'
+        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+            config.write(f)
+
+    try:
+        progress = int(settings.get('DOWNLOAD_PROGRESS_THRESHOLD', '25'))
+        if not 1 <= progress <= 100:
+            raise ValueError
+    except ValueError:
+        print("❌ DOWNLOAD_PROGRESS_THRESHOLD должен быть от 1 до 100. Установлено 25")
+        config['SETTINGS']['DOWNLOAD_PROGRESS_THRESHOLD'] = '25'
+        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+            config.write(f)
+
     return config['SETTINGS']
 
 conf = load_config()
@@ -44,6 +72,9 @@ DAYS_LIMIT = conf.getint('DAYS_LIMIT')
 RATIO_THRESHOLD = conf.getfloat('RATIO_THRESHOLD')
 LEECH_SUM_THRESHOLD = conf.getint('LEECH_SUM_THRESHOLD')
 STARTUP_WAIT_SEC = conf.getint('STARTUP_WAIT_SEC')
+DISK_THRESHOLD_PERCENT = conf.getint('DISK_THRESHOLD_PERCENT')
+RSS_RULE_NAME = conf.get('RSS_RULE_NAME', '').strip()
+DOWNLOAD_PROGRESS_THRESHOLD = conf.getint('DOWNLOAD_PROGRESS_THRESHOLD')
 
 session = requests.Session()
 
@@ -77,15 +108,17 @@ def clean_old_logs():
 # === ДАННЫЕ ===
 def load_data():
     if not os.path.exists(DATA_FILE):
-        return {"torrents": {}, "blacklist": []}
+        return {"torrents": {}, "blacklist": [], "paused_by_disk": []}
     try:
         with open(DATA_FILE, "r", encoding="utf-8") as f:
             content = json.load(f)
             if "torrents" not in content:
-                return {"torrents": content, "blacklist": []}
+                content = {"torrents": content, "blacklist": [], "paused_by_disk": []}
+            if "paused_by_disk" not in content:
+                content["paused_by_disk"] = []
             return content
     except (json.JSONDecodeError, IOError):
-        return {"torrents": {}, "blacklist": []}
+        return {"torrents": {}, "blacklist": [], "paused_by_disk": []}
 
 def save_data(data):
     try:
@@ -103,6 +136,51 @@ def login():
         logging.info("Успешная авторизация в qBittorrent")
     except RequestException as e:
         raise Exception(f"Не удалось подключиться к qBit: {e}")
+
+# === ПОЛУЧЕНИЕ ПУТИ ИЗ ПРАВИЛА RSS ===
+def get_rss_rule_save_path(rule_name):
+    try:
+        r = session.get(f"{QB_URL}/api/v2/rss/rules", timeout=10)
+        if r.status_code != 200:
+            return None
+        rules = r.json()
+        if rule_name not in rules:
+            logging.warning(f"Правило RSS '{rule_name}' не найдено")
+            return None
+        save_path = rules[rule_name].get('savePath', '').strip()
+        if not save_path:
+            logging.warning(f"Правило RSS '{rule_name}' не имеет пути сохранения")
+            return None
+        return save_path
+    except Exception as e:
+        logging.error(f"Ошибка получения пути RSS правила: {e}")
+        return None
+
+# === ПРОВЕРКА ДИСКА ===
+def get_disk_usage_percent(path):
+    try:
+        usage = shutil.disk_usage(path)
+        return round(usage.used / usage.total * 100, 1)
+    except Exception as e:
+        logging.error(f"Ошибка проверки диска '{path}': {e}")
+        return None
+
+# === УПРАВЛЕНИЕ АВТОЗАГРУЗКОЙ RSS ===
+def set_rss_autodownload(enabled: bool):
+    try:
+        r = session.post(
+            f"{QB_URL}/api/v2/app/setPreferences",
+            data={"json": json.dumps({"rss_auto_downloading_enabled": enabled})},
+            timeout=10
+        )
+        if r.status_code == 200:
+            status = "включена" if enabled else "отключена"
+            logging.info(f"RSS автозагрузка — {status}")
+            print(f"{'✅' if enabled else '⏸️'} RSS автозагрузка — {status}")
+        else:
+            logging.error(f"Ошибка изменения автозагрузки RSS: {r.status_code}")
+    except Exception as e:
+        logging.error(f"Ошибка изменения автозагрузки RSS: {e}")
 
 # === RSS ИСКЛЮЧЕНИЯ ===
 def add_to_rss_exclude(torrent_name):
@@ -132,6 +210,83 @@ def delete_torrent(hash_, name, reason=""):
     except Exception as e:
         logging.error(f"Ошибка удаления {name}: {e}")
 
+# === ПАУЗА ТОРРЕНТА ===
+def pause_torrent(hash_, name, reason=""):
+    try:
+        logging.info(f"ПАУЗА: {name} | Причина: {reason}")
+        print(f"⏸️ Пауза: {name} ({reason})")
+        session.post(f"{QB_URL}/api/v2/torrents/pause", data={"hashes": hash_}, timeout=10)
+    except Exception as e:
+        logging.error(f"Ошибка паузы {name}: {e}")
+
+# === ВОЗОБНОВЛЕНИЕ ТОРРЕНТОВ ===
+def resume_torrents(hashes: list):
+    try:
+        hashes_str = "|".join(hashes)
+        session.post(f"{QB_URL}/api/v2/torrents/resume", data={"hashes": hashes_str}, timeout=10)
+        logging.info(f"ВОЗОБНОВЛЕНО: {len(hashes)} торрентов")
+        print(f"▶️ Возобновлено торрентов: {len(hashes)}")
+    except Exception as e:
+        logging.error(f"Ошибка возобновления торрентов: {e}")
+
+# === ПРОВЕРКА ДИСКА И УПРАВЛЕНИЕ ЗАГРУЗКАМИ ===
+def check_disk_and_manage(torrents, paused_by_disk):
+    if not RSS_RULE_NAME:
+        logging.warning("RSS_RULE_NAME не задан в config.ini — проверка диска пропущена")
+        print("⚠️ RSS_RULE_NAME не задан в config.ini")
+        return paused_by_disk
+
+    save_path = get_rss_rule_save_path(RSS_RULE_NAME)
+    if not save_path:
+        return paused_by_disk
+
+    disk_percent = get_disk_usage_percent(save_path)
+    if disk_percent is None:
+        return paused_by_disk
+
+    logging.info(f"Диск '{save_path}': занято {disk_percent}% (порог {DISK_THRESHOLD_PERCENT}%)")
+    print(f"💾 Диск '{save_path}': {disk_percent}% занято (порог {DISK_THRESHOLD_PERCENT}%)")
+
+    downloading_states = {'downloading', 'stalledDL', 'checkingDL', 'queuedDL', 'metaDL', 'forcedDL'}
+
+    if disk_percent >= DISK_THRESHOLD_PERCENT:
+        logging.warning(f"Диск заполнен на {disk_percent}% — принимаем меры")
+        print(f"⚠️ Диск заполнен на {disk_percent}%")
+
+        # Отключаем RSS автозагрузку
+        set_rss_autodownload(enabled=False)
+
+        for t in torrents:
+            if t["state"] not in downloading_states:
+                continue
+
+            h = t["hash"]
+            name = t["name"]
+            progress = t.get("progress", 0) * 100  # progress в qBit от 0.0 до 1.0
+
+            if progress < DOWNLOAD_PROGRESS_THRESHOLD:
+                # Удаляем недокачанные
+                delete_torrent(h, name, reason=f"Диск забит ({disk_percent}%), прогресс {progress:.1f}%")
+            else:
+                # Паузим те что >= порога прогресса
+                if h not in paused_by_disk:
+                    pause_torrent(h, name, reason=f"Диск забит ({disk_percent}%), прогресс {progress:.1f}%")
+                    paused_by_disk.append(h)
+
+    else:
+        # Место освободилось — включаем RSS и возобновляем
+        set_rss_autodownload(enabled=True)
+
+        if paused_by_disk:
+            # Проверяем что торренты ещё существуют
+            active_hashes = {t["hash"] for t in torrents}
+            to_resume = [h for h in paused_by_disk if h in active_hashes]
+            if to_resume:
+                resume_torrents(to_resume)
+            paused_by_disk = []
+
+    return paused_by_disk
+
 # === ОСНОВНАЯ ЛОГИКА ===
 def main():
     setup_logger()
@@ -159,9 +314,12 @@ def main():
     full_data = load_data()
     data = full_data["torrents"]
     blacklist = full_data["blacklist"]
+    paused_by_disk = full_data["paused_by_disk"]
 
-    # Ограничение чёрного списка
     blacklist = blacklist[-500:]
+
+    # === ПРОВЕРКА ДИСКА ===
+    paused_by_disk = check_disk_and_manage(torrents, paused_by_disk)
 
     now = datetime.now()
     today_str = now.date().isoformat()
@@ -171,9 +329,7 @@ def main():
 
     stats = {"new": 0, "deleted_error": 0, "deleted_old": 0, "blacklisted": 0, "waiting": 0, "skipped_downloading": 0}
 
-    # Статусы скачивания — пропускаем
     downloading_states = {'downloading', 'stalledDL', 'checkingDL', 'pausedDL', 'queuedDL', 'metaDL', 'forcedDL'}
-
     error_states = {'error', 'missingFiles', 'unknown', 'stalled_error'}
 
     for t in torrents:
@@ -241,7 +397,7 @@ def main():
         except Exception as e:
             logging.error(f"Ошибка обработки {name}: {e}")
 
-    save_data({"torrents": data, "blacklist": blacklist})
+    save_data({"torrents": data, "blacklist": blacklist, "paused_by_disk": paused_by_disk})
 
     # === ИТОГИ ===
     summary = (
